@@ -54,19 +54,29 @@ const MAX_OSC_RAW: usize = 1024;
 ///
 /// # Why this size
 ///
-/// Sized from what a legitimate APC needs, plus headroom. The kitty graphics
-/// protocol, the reason APC buffering exists here, recommends chunking payloads
-/// into 4096-byte pieces, so a well-behaved client never approaches this; the
-/// cap is not smaller because a single *non-chunked* transmission is permitted
-/// and can legitimately be large. 256 KiB is ~64 chunks of slack.
+/// **Not** from the specification's 4096-byte chunk suggestion. Real clients do
+/// not use it: kitty's own graphics helper chunks at `chunk_size = 128 * 1024`
+/// (tools/tui/graphics/command.go:287), applied to data that is **already
+/// base64-encoded** — the encode happens before the loop — so one escape from
+/// `icat` carries up to 128 KiB of payload plus a short control block. Measured
+/// against the real client: a 440747-byte transmission arrives as four chunks
+/// of 131072, 131072, 131072 and 47531.
 ///
-/// It coincides with kitty's own `MAX_ESCAPE_CODE_LENGTH` (`BUF_SZ / 4u`,
-/// kitty/vt-parser.c:18-21), which is a useful sanity check but **not a
-/// protocol limit and not a precedent to copy blindly**: that number is the
-/// largest escape kitty will *buffer*, and it has a streaming hatch behind it
-/// -- on overflow it special-cases OSC 52, dispatching a partial payload and
-/// continuing (vt-parser.c:459-471), so OSC 52 is not bounded by it at all.
-/// Nothing in the graphics protocol specifies a maximum APC length.
+/// So this cap is 2x the largest escape a real client emits, not the 64x a
+/// 4096-byte chunk would imply. That is a deliberately narrow margin, and the
+/// margin is not the reason it is safe.
+///
+/// **The reason it is safe is that it equals kitty's own limit.**
+/// `MAX_ESCAPE_CODE_LENGTH = BUF_SZ / 4u` with `BUF_SZ = 1024 * 1024`
+/// (kitty/vt-parser.c:18-21), so an escape too long for us is also too long for
+/// the reference implementation and no client can be relying on it. That
+/// invariant holds whatever chunk size clients pick next, which the
+/// count-of-chunks reasoning would not.
+///
+/// Note kitty's number is the largest escape it will *buffer*, and it keeps a
+/// streaming hatch behind it — on overflow it special-cases OSC 52 to dispatch
+/// a partial payload and continue (vt-parser.c:459-471). Nothing in the
+/// graphics protocol specifies a maximum APC length.
 ///
 /// Note this bounds the *std* build only. Under `no_std` the shared `osc_raw`
 /// is an `ArrayVec` whose capacity (`OSC_RAW_BUF_SIZE`, default `MAX_OSC_RAW`)

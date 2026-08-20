@@ -87,14 +87,21 @@ All of that is **source reading; nobody has run these terminals.**
 **2. `MAX_APC_RAW` bounds a buffer upstream does not have.** Upstream buffers no
 APC at all, so it has no cap to diverge from.
 
-*The size* is chosen from what a legitimate APC needs: the graphics protocol
-recommends 4096-byte chunks, so 256 KiB is ~64 chunks of headroom, and it is not
-smaller because a single non-chunked transmission is permitted and can be large.
-It happens to equal kitty's `MAX_ESCAPE_CODE_LENGTH` (`BUF_SZ / 4u`,
-vt-parser.c:18-21). That is a sanity check, **not a precedent** — kitty's number
-is the largest escape it will *buffer*, and it keeps a streaming hatch behind
-it, special-casing OSC 52 on overflow to dispatch a partial payload and continue
-(vt-parser.c:459-471). Nothing in the protocol specifies a maximum APC length.
+*The size* is **not** taken from the specification's 4096-byte chunk
+suggestion, which real clients ignore: kitty's own helper chunks at
+`128 * 1024` (tools/tui/graphics/command.go:287) on data that is already
+base64-encoded, so one `icat` escape carries up to 128 KiB. Measured — a
+440747-byte transmission arrives as 131072 + 131072 + 131072 + 47531. This cap
+is therefore **2x** the largest real escape, not 64x, and the margin is not why
+it is safe.
+
+It is safe because it **equals kitty's own limit**, `MAX_ESCAPE_CODE_LENGTH =
+BUF_SZ / 4u` (vt-parser.c:18-21): an escape too long for us is too long for the
+reference implementation too, so no client can depend on it. That invariant
+survives clients changing their chunk size; a count-of-chunks argument would
+not. Note kitty's number is the largest escape it will *buffer* and it keeps a
+streaming hatch behind it for OSC 52 (vt-parser.c:459-471); nothing in the
+protocol specifies a maximum APC length.
 
 *The policy* — discard rather than truncate-and-dispatch — is the load-bearing
 choice. A truncated graphics command that looks well-formed corrupts the
