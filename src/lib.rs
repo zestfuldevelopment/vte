@@ -44,6 +44,24 @@ pub use params::{Params, ParamsIter};
 const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC_PARAMS: usize = 16;
 const MAX_OSC_RAW: usize = 1024;
+/// Maximum APC payload retained before the sequence is abandoned.
+///
+/// **zestful divergence from upstream vte.** Upstream has no APC buffer at all,
+/// so it has no cap either. We buffer APC (see `State::ApcString`) and therefore
+/// have to bound it: the payload is attacker-supplied in the ordinary case --
+/// the "client" writing to a tty is any program, including a remote host over
+/// ssh -- so an APC that never terminates is otherwise unbounded allocation.
+///
+/// 256 KiB matches kitty, the reference implementation of the graphics protocol
+/// this exists to carry: `MAX_ESCAPE_CODE_LENGTH = BUF_SZ / 4u` with
+/// `BUF_SZ = 1024 * 1024` (kitty/vt-parser.c:18-21). The protocol recommends
+/// 4096-byte chunks, so this is ~64 chunks of headroom; a single non-chunked
+/// APC can legitimately be large, which is why the cap is not smaller.
+///
+/// Note this bounds the *std* build only. Under `no_std` the shared `osc_raw`
+/// is an `ArrayVec` whose capacity (`OSC_RAW_BUF_SIZE`, default `MAX_OSC_RAW`)
+/// is already the binding limit and is far smaller.
+const MAX_APC_RAW: usize = 256 * 1024;
 
 /// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`]
 ///
@@ -179,6 +197,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::Escape => self.advance_esc(performer, byte),
             State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
             State::OscString => self.advance_osc_string(performer, byte),
+            State::ApcString => self.advance_apc_string(performer, byte),
+            State::ApcIgnore => self.advance_apc_ignore(performer, byte),
             State::SosPmApcString => self.anywhere(performer, byte),
             State::Ground => unreachable!(),
         }
@@ -374,7 +394,14 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.osc_num_params = 0;
                 self.state = State::OscString
             },
-            0x5E..=0x5F => self.state = State::SosPmApcString,
+            // zestful: 0x5F (APC) split out of the upstream `0x5E..=0x5F` arm so
+            // its payload can be buffered and dispatched. 0x5E (PM) and 0x58
+            // (SOS, above) keep upstream's discard-everything behaviour.
+            0x5E => self.state = State::SosPmApcString,
+            0x5F => {
+                self.osc_raw.clear();
+                self.state = State::ApcString
+            },
             0x60..=0x7E => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
@@ -401,6 +428,130 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x7F => (),
             _ => self.anywhere(performer, byte),
         }
+    }
+
+    /// Buffer an APC payload, modelled on [`Self::advance_osc_string`].
+    ///
+    /// **zestful addition.** Upstream vte routes APC through `anywhere()`, which
+    /// discards every payload byte; see the fork notes for why that is not
+    /// something we can work around outside the parser.
+    ///
+    /// # Why BEL terminates an APC here
+    ///
+    /// This is a DELIBERATE deviation from the vt500 state diagram vte
+    /// implements, which specifies `00-17,19,1C-1F,20-7F / ignore` for the
+    /// sos/pm/apc string state -- 0x07 is inside `00-17`, so ignoring it is the
+    /// conformant behaviour and upstream vte is NOT buggy here. Do not "fix"
+    /// this back without reading the following.
+    ///
+    /// The justification is robustness, not conformance and not compatibility.
+    /// A client that emits a BEL-terminated APC -- which current kitty accepts
+    /// -- would otherwise have all of its subsequent output silently destroyed
+    /// up to the next ESC, because a conformant parser stays in the string state
+    /// forever. Accepting BEL costs us nothing: a conformant client sends ST,
+    /// and it is unaffected.
+    ///
+    /// It is emphatically NOT the case that "every terminal does this". The
+    /// ecosystem disagrees four ways, and vte is not an outlier:
+    ///
+    /// - **kitty** terminates on BEL, in both parser generations:
+    ///   `find_st_terminator` scans for BEL or ESC-ST (kitty/vt-parser.c:400-421)
+    ///   and `consume_input` (:1541-1545) routes OSC/APC/PM/DCS/SOS through it;
+    ///   in v0.32.2's older parser, `accumulate_oth` -- the APC/PM accumulator --
+    ///   opened `case ST: return true; case BEL: return true;` (parser.c:1213-1219).
+    ///   It is undocumented either way: kitty's own graphics-protocol docs and
+    ///   parser tests use ESC-backslash exclusively.
+    /// - **xterm** rings the bell and *continues* the string.
+    /// - **wezterm** appends BEL to the payload, and scopes BEL-as-terminator to
+    ///   OSC deliberately.
+    /// - **foot** ignores it, byte-for-byte identical to upstream vte.
+    ///
+    /// So no client can *rely* on BEL, and we do not claim otherwise. All of the
+    /// above is source reading; nobody has run these terminals.
+    #[inline(always)]
+    fn advance_apc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            // C0 controls the diagram ignores. 0x07 is deliberately NOT here.
+            0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1C..=0x1F => (),
+            // BEL: see the doc comment above.
+            0x07 => {
+                self.apc_end(performer);
+                self.state = State::Ground
+            },
+            // CAN/SUB abort the sequence. Unlike the OSC path, which calls
+            // `osc_end` here, we deliberately do NOT dispatch: a cancelled APC
+            // is a cancelled graphics command, and handing it on as if complete
+            // would execute something the client explicitly abandoned.
+            0x18 | 0x1A => {
+                self.osc_raw.clear();
+                performer.execute(byte);
+                self.state = State::Ground
+            },
+            // ESC: ends the payload. `ESC \` (ST) arrives as ESC then 0x5C,
+            // which `advance_esc` turns into an `esc_dispatch`; the payload is
+            // already dispatched by then, exactly as the OSC path behaves.
+            0x1B => {
+                self.apc_end(performer);
+                self.reset_params();
+                self.state = State::Escape
+            },
+            _ => {
+                if self.osc_raw.len() >= MAX_APC_RAW {
+                    // Over the cap: discard the whole sequence rather than
+                    // dispatch a prefix. A truncated graphics command that looks
+                    // well-formed is worse than a clean refusal -- with `m=1`
+                    // chunking it corrupts the assembled image, not just one
+                    // chunk. kitty made this same move: v0.32.2 truncated and
+                    // dispatched (parser.c:1228-1231), current kitty reports an
+                    // error and discards without dispatching (vt-parser.c:472-473).
+                    //
+                    // We improve on kitty in one respect: kitty returns to
+                    // ground immediately, so the remainder of an oversized APC
+                    // is interpreted as text and spews onto the screen. We
+                    // consume to the terminator first.
+                    self.osc_raw.clear();
+                    self.state = State::ApcIgnore;
+                    return;
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    // `osc_raw` is a fixed ArrayVec here; its capacity binds
+                    // before MAX_APC_RAW ever does.
+                    if self.osc_raw.is_full() {
+                        self.osc_raw.clear();
+                        self.state = State::ApcIgnore;
+                        return;
+                    }
+                }
+                self.osc_raw.push(byte);
+            },
+        }
+    }
+
+    /// Consume an over-long APC to its terminator without buffering or
+    /// dispatching it. **zestful addition**; see [`MAX_APC_RAW`].
+    #[inline(always)]
+    fn advance_apc_ignore<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x07 => self.state = State::Ground,
+            0x18 | 0x1A => {
+                performer.execute(byte);
+                self.state = State::Ground
+            },
+            0x1B => {
+                self.reset_params();
+                self.state = State::Escape
+            },
+            _ => (),
+        }
+    }
+
+    /// Hand a buffered APC payload to the performer and reset the buffer.
+    /// **zestful addition.**
+    #[inline(always)]
+    fn apc_end<P: Perform>(&mut self, performer: &mut P) {
+        performer.apc_dispatch(&self.osc_raw);
+        self.osc_raw.clear();
     }
 
     #[inline(always)]
@@ -743,6 +894,13 @@ enum State {
     Escape,
     EscapeIntermediate,
     OscString,
+    /// APC payload being buffered. Split out of `SosPmApcString` by zestful so
+    /// the body reaches `Perform::apc_dispatch`; SOS and PM keep the upstream
+    /// discard-everything behaviour.
+    ApcString,
+    /// APC that has exceeded [`MAX_APC_RAW`]: consume to the terminator, then
+    /// return to ground **without dispatching**. Mirrors `CsiIgnore`/`DcsIgnore`.
+    ApcIgnore,
     SosPmApcString,
     #[default]
     Ground,
@@ -790,6 +948,15 @@ pub trait Perform {
 
     /// Dispatch an operating system command.
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+
+    /// Called with the payload of an APC (Application Program Command) string.
+    ///
+    /// **zestful addition to upstream vte.** Upstream discards APC payloads
+    /// entirely; this carries the kitty graphics protocol. The payload excludes
+    /// the introducer (`ESC _`) and the terminator, and is capped at
+    /// [`MAX_APC_RAW`] -- an APC exceeding that is dropped, not truncated, so a
+    /// slice handed here is always a complete sequence.
+    fn apc_dispatch(&mut self, _bytes: &[u8]) {}
 
     /// A final character has arrived for a CSI sequence
     ///
@@ -857,9 +1024,15 @@ mod tests {
         Print(char),
         Execute(u8),
         DcsUnhook,
+        /// **zestful addition.**
+        Apc(Vec<u8>),
     }
 
     impl Perform for Dispatcher {
+        fn apc_dispatch(&mut self, bytes: &[u8]) {
+            self.dispatched.push(Sequence::Apc(bytes.to_vec()));
+        }
+
         fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
             let params = params.iter().map(|p| p.to_vec()).collect();
             self.dispatched.push(Sequence::Osc(params, bell_terminated));
@@ -1539,4 +1712,155 @@ mod tests {
         assert_eq!(dispatcher.dispatched[0], Sequence::Execute(0x18));
         assert_eq!(dispatcher.dispatched[1], Sequence::Execute(0x1A));
     }
+
+    // ---- zestful APC tests ----------------------------------------------
+    //
+    // Upstream vte discards every APC payload byte. These pin the fork's
+    // additions; see the doc comments on `advance_apc_string` and
+    // `MAX_APC_RAW` for the reasoning behind BEL and the overflow policy.
+
+    /// Helper: run one input and return everything dispatched.
+    fn apc_run(input: &[u8]) -> Vec<Sequence> {
+        let mut d = Dispatcher::default();
+        let mut p = Parser::new();
+        p.advance(&mut d, input);
+        d.dispatched
+    }
+
+    fn printed(seq: &[Sequence]) -> String {
+        seq.iter()
+            .filter_map(|s| match s {
+                Sequence::Print(c) => Some(*c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn apc_payloads(seq: &[Sequence]) -> Vec<Vec<u8>> {
+        seq.iter()
+            .filter_map(|s| match s {
+                Sequence::Apc(b) => Some(b.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn apc_payload_reaches_the_performer() {
+        let seq = apc_run(b"\x1b_Gf=24,s=10,v=10;AAAA\x1b\\");
+        assert_eq!(apc_payloads(&seq), vec![b"Gf=24,s=10,v=10;AAAA".to_vec()]);
+    }
+
+    /// The ST terminator must not leak into the payload, and the `\` of `ESC \`
+    /// must not be printed as text.
+    #[test]
+    fn st_terminator_is_not_part_of_the_payload() {
+        let seq = apc_run(b"A\x1b_Gi=1;xy\x1b\\B");
+        assert_eq!(apc_payloads(&seq), vec![b"Gi=1;xy".to_vec()]);
+        assert_eq!(printed(&seq), "AB");
+    }
+
+    /// Regression: BEL-terminated APC used to wedge the parser, silently
+    /// destroying everything up to the next ESC. `"A\x1b_G…\x07B"` yielded
+    /// `"A"`. See `advance_apc_string`'s doc comment for why we accept BEL at
+    /// all -- it is a deliberate deviation from the vt500 diagram.
+    #[test]
+    fn bel_terminates_an_apc_and_does_not_swallow_the_stream() {
+        let seq = apc_run(b"A\x1b_Gf=24;xyz\x07B");
+        assert_eq!(apc_payloads(&seq), vec![b"Gf=24;xyz".to_vec()]);
+        assert_eq!(printed(&seq), "AB", "the byte after a BEL-terminated APC must survive");
+    }
+
+    /// The same stream stock vte loses entirely.
+    #[test]
+    fn output_after_an_unterminated_apc_is_not_destroyed_by_bel() {
+        let seq = apc_run(b"A\x1b_G\x07hello\x1b\\TAIL");
+        assert_eq!(printed(&seq), "AhelloTAIL");
+    }
+
+    /// An APC over `MAX_APC_RAW` is dropped whole, never dispatched truncated:
+    /// a well-formed-looking prefix would corrupt an assembled image under
+    /// `m=1` chunking. The rest of the sequence must not spew as text either.
+    #[test]
+    fn oversized_apc_is_discarded_not_truncated() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"A\x1b_G");
+        input.extend(core::iter::repeat(b'x').take(MAX_APC_RAW + 4096));
+        input.extend_from_slice(b"\x1b\\B");
+
+        let seq = apc_run(&input);
+        assert!(apc_payloads(&seq).is_empty(), "an over-long APC must not be dispatched at all");
+        assert_eq!(printed(&seq), "AB", "the discarded body must not be printed as text");
+    }
+
+    /// Exactly at the cap still dispatches -- the boundary is not off by one.
+    #[test]
+    fn apc_at_exactly_the_cap_is_delivered() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b_");
+        input.extend(core::iter::repeat(b'x').take(MAX_APC_RAW));
+        input.extend_from_slice(b"\x1b\\");
+
+        let seq = apc_run(&input);
+        assert_eq!(apc_payloads(&seq).len(), 1);
+        assert_eq!(apc_payloads(&seq)[0].len(), MAX_APC_RAW);
+    }
+
+    /// CAN and SUB abort the sequence. Unlike the OSC path we deliberately do
+    /// not dispatch: a cancelled graphics command must not be executed.
+    #[test]
+    fn can_and_sub_abort_an_apc_without_dispatching() {
+        for abort in [0x18u8, 0x1a] {
+            let seq = apc_run(&[b'A', 0x1b, b'_', b'G', b'i', b'=', b'1', abort, b'B']);
+            assert!(apc_payloads(&seq).is_empty(), "0x{abort:02x} must not dispatch");
+            assert_eq!(printed(&seq), "AB");
+        }
+    }
+
+    /// PM and SOS keep upstream's behaviour: payload discarded, no callback.
+    /// Only APC (0x5f) was split out.
+    #[test]
+    fn pm_and_sos_are_untouched_by_the_apc_split() {
+        for introducer in [b'\x5e', b'\x58'] {
+            let seq = apc_run(&[b'A', 0x1b, introducer, b'j', b'u', b'n', b'k', 0x1b, b'\\', b'B']);
+            assert!(apc_payloads(&seq).is_empty(), "only APC dispatches");
+            assert_eq!(printed(&seq), "AB");
+        }
+    }
+
+    /// An APC split across `advance` calls must reassemble.
+    #[test]
+    fn apc_reassembles_across_advance_calls() {
+        let mut d = Dispatcher::default();
+        let mut p = Parser::new();
+        p.advance(&mut d, b"\x1b_Gf=100,");
+        p.advance(&mut d, b"i=7;PAYLOAD");
+        p.advance(&mut d, b"\x1b\\");
+        assert_eq!(apc_payloads(&d.dispatched), vec![b"Gf=100,i=7;PAYLOAD".to_vec()]);
+    }
+
+    /// APC and OSC share `osc_raw`; neither may corrupt the other.
+    #[test]
+    fn apc_and_osc_do_not_corrupt_each_others_buffer() {
+        let seq = apc_run(b"\x1b]0;title\x07\x1b_Gi=1;img\x1b\\\x1b]0;second\x07");
+        assert_eq!(apc_payloads(&seq), vec![b"Gi=1;img".to_vec()]);
+        let oscs: Vec<Vec<Vec<u8>>> = seq
+            .iter()
+            .filter_map(|s| match s {
+                Sequence::Osc(p, _) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(oscs.len(), 2);
+        assert_eq!(oscs[0][1], b"title".to_vec());
+        assert_eq!(oscs[1][1], b"second".to_vec());
+    }
+
+    /// An empty APC is still a dispatch, not a silent drop.
+    #[test]
+    fn empty_apc_dispatches_an_empty_payload() {
+        let seq = apc_run(b"\x1b_\x1b\\");
+        assert_eq!(apc_payloads(&seq), vec![Vec::<u8>::new()]);
+    }
+
 }

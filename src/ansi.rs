@@ -493,6 +493,25 @@ pub trait Timeout: Default {
 /// XXX Should probably not provide default impls for everything, but it makes
 /// writing specific handler impls for tests far easier.
 pub trait Handler {
+    /// APC (Application Program Command) payload, excluding introducer and
+    /// terminator.
+    ///
+    /// **zestful addition to upstream vte.** This carries the kitty graphics
+    /// protocol. Upstream discards APC entirely and has no equivalent hook; see
+    /// the fork notes. The payload is capped at the parser's `MAX_APC_RAW` and
+    /// an over-long APC is dropped rather than truncated, so a slice delivered
+    /// here is always a complete sequence.
+    fn apc_dispatch(&mut self, _bytes: &[u8]) {}
+
+    /// An OSC this crate does not implement itself.
+    ///
+    /// **zestful addition to upstream vte**, where these are logged and
+    /// dropped. `params` is the raw semicolon-split sequence, `params[0]` being
+    /// the OSC number. Implementing an OSC vte does not handle -- 7, 9;4, 133,
+    /// 777 -- is a match arm here rather than a second parser in the embedder's
+    /// PTY read path.
+    fn osc_unhandled(&mut self, _params: &[&[u8]]) {}
+
     /// OSC to set window title.
     fn set_title(&mut self, _: Option<String>) {}
 
@@ -1325,11 +1344,26 @@ where
         debug!("[unhandled unhook]");
     }
 
+    /// **zestful addition.** Forward an APC payload to the handler.
     #[inline]
+    fn apc_dispatch(&mut self, bytes: &[u8]) {
+        self.handler.apc_dispatch(bytes);
+    }
+
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
 
-        fn unhandled(params: &[&[u8]]) {
+        /// **zestful divergence from upstream vte.** Upstream logs the
+        /// sequence at `debug!` and drops it. We log it *and* hand it to
+        /// [`Handler::osc_unhandled`], so an embedder can implement any OSC vte
+        /// chose not to -- OSC 7, OSC 9;4, OSC 133, OSC 777 -- as a match arm
+        /// rather than as a second parser in its PTY read path.
+        ///
+        /// See the fork notes: this is expected to be the longest-lived part of
+        /// the fork, because a blanket passthrough exposes everything upstream
+        /// deliberately did not implement and is a larger ask than the APC
+        /// methods.
+        fn unhandled<H: Handler>(handler: &mut H, params: &[&[u8]]) {
             let mut buf = String::new();
             for items in params {
                 buf.push('[');
@@ -1339,6 +1373,7 @@ where
                 buf.push_str("],");
             }
             debug!("[unhandled osc_dispatch]: [{}] at line {}", &buf, line!());
+            handler.osc_unhandled(params);
         }
 
         if params.is_empty() || params[0].is_empty() {
@@ -1359,13 +1394,13 @@ where
                     self.handler.set_title(Some(title));
                     return;
                 }
-                unhandled(params);
+                unhandled(self.handler, params);
             },
 
             // Set color index.
             b"4" => {
                 if params.len() <= 1 || params.len() % 2 == 0 {
-                    unhandled(params);
+                    unhandled(self.handler, params);
                     return;
                 }
 
@@ -1373,7 +1408,7 @@ where
                     let index = match parse_number(chunk[0]) {
                         Some(index) => index,
                         None => {
-                            unhandled(params);
+                            unhandled(self.handler, params);
                             continue;
                         },
                     };
@@ -1384,7 +1419,7 @@ where
                         let prefix = alloc::format!("4;{index}");
                         self.handler.dynamic_color_sequence(prefix, index as usize, terminator);
                     } else {
-                        unhandled(params);
+                        unhandled(self.handler, params);
                     }
                 }
             },
@@ -1429,7 +1464,7 @@ where
 
                             // End of setting dynamic colors.
                             if index > NamedColor::Cursor as usize {
-                                unhandled(params);
+                                unhandled(self.handler, params);
                                 break;
                             }
 
@@ -1442,14 +1477,14 @@ where
                                     terminator,
                                 );
                             } else {
-                                unhandled(params);
+                                unhandled(self.handler, params);
                             }
                             dynamic_code += 1;
                         }
                         return;
                     }
                 }
-                unhandled(params);
+                unhandled(self.handler, params);
             },
 
             // Set mouse cursor shape.
@@ -1471,18 +1506,18 @@ where
                         '0' => CursorShape::Block,
                         '1' => CursorShape::Beam,
                         '2' => CursorShape::Underline,
-                        _ => return unhandled(params),
+                        _ => return unhandled(self.handler, params),
                     };
                     self.handler.set_cursor_shape(shape);
                     return;
                 }
-                unhandled(params);
+                unhandled(self.handler, params);
             },
 
             // Set clipboard.
             b"52" => {
                 if params.len() < 3 {
-                    return unhandled(params);
+                    return unhandled(self.handler, params);
                 }
 
                 let clipboard = params[1].first().unwrap_or(&b'c');
@@ -1506,7 +1541,7 @@ where
                 for param in &params[1..] {
                     match parse_number(param) {
                         Some(index) => self.handler.reset_color(index as usize),
-                        None => unhandled(params),
+                        None => unhandled(self.handler, params),
                     }
                 }
             },
@@ -1520,7 +1555,7 @@ where
             // Reset text cursor color.
             b"112" => self.handler.reset_color(NamedColor::Cursor as usize),
 
-            _ => unhandled(params),
+            _ => unhandled(self.handler, params),
         }
     }
 
@@ -2455,4 +2490,91 @@ mod tests {
         let rgb2 = Rgb { r: 0xFE, g: 0xDC, b: 0xBA };
         assert!((rgb1.contrast(rgb2) - 9.786_558_997_257_74).abs() < f64::EPSILON);
     }
+
+    // ---- zestful passthrough tests ---------------------------------------
+
+    /// Handler that records what the two zestful hooks deliver.
+    #[derive(Default)]
+    struct PassthroughHandler {
+        apc: Vec<Vec<u8>>,
+        osc_unhandled: Vec<Vec<Vec<u8>>>,
+        titles: Vec<Option<String>>,
+    }
+
+    impl Handler for PassthroughHandler {
+        fn apc_dispatch(&mut self, bytes: &[u8]) {
+            self.apc.push(bytes.to_vec());
+        }
+
+        fn osc_unhandled(&mut self, params: &[&[u8]]) {
+            self.osc_unhandled.push(params.iter().map(|p| p.to_vec()).collect());
+        }
+
+        fn set_title(&mut self, t: Option<String>) {
+            self.titles.push(t);
+        }
+    }
+
+    fn drive(input: &[u8]) -> PassthroughHandler {
+        let mut processor = Processor::<TestSyncHandler>::default();
+        let mut handler = PassthroughHandler::default();
+        processor.advance(&mut handler, input);
+        handler
+    }
+
+    /// OSC 7 (cwd) is one vte does not implement. Upstream logs and drops it;
+    /// the fork hands it on so an embedder can implement it as a match arm.
+    #[test]
+    fn unhandled_osc_reaches_the_handler() {
+        let h = drive(b"\x1b]7;file://host/tmp\x1b\\");
+        assert_eq!(h.osc_unhandled.len(), 1);
+        assert_eq!(h.osc_unhandled[0][0], b"7".to_vec());
+        assert_eq!(h.osc_unhandled[0][1], b"file://host/tmp".to_vec());
+    }
+
+    /// OSC 133 is the prompt-marking sequence zterm currently scans for with a
+    /// hand-rolled byte scanner in its PTY read path. Arriving here, in stream
+    /// order, is what lets that scanner be deleted rather than duplicated.
+    #[test]
+    fn osc_133_reaches_the_handler() {
+        let h = drive(b"\x1b]133;A\x07");
+        assert_eq!(h.osc_unhandled.len(), 1);
+        assert_eq!(h.osc_unhandled[0][0], b"133".to_vec());
+    }
+
+    /// An OSC vte *does* implement must not be duplicated into the passthrough.
+    #[test]
+    fn handled_osc_does_not_also_go_to_the_passthrough() {
+        let h = drive(b"\x1b]0;a title\x07");
+        assert_eq!(h.titles, vec![Some("a title".to_owned())]);
+        assert!(h.osc_unhandled.is_empty(), "OSC 0 is handled; it must not pass through");
+    }
+
+    /// APC reaches `Handler`, not just `Perform` -- this is the seam
+    /// `alacritty_terminal`'s `Term` will implement.
+    #[test]
+    fn apc_reaches_the_ansi_handler() {
+        let h = drive(b"\x1b_Gf=100,a=T;BASE64DATA\x1b\\");
+        assert_eq!(h.apc, vec![b"Gf=100,a=T;BASE64DATA".to_vec()]);
+    }
+
+    /// ESC terminates an APC payload, so an `ESC ] 133` appearing after image
+    /// data is a **real** OSC 133, not image bytes misread as one.
+    ///
+    /// This test exists to record a NEGATIVE result. The fork was partly
+    /// justified by the claim that zterm's `Osc133Scanner` produces a false
+    /// prompt mark from image data, evidenced by this exact input. It does not:
+    /// a correct parser dispatches the same OSC 133 here, because the ESC ended
+    /// the APC. Kitty payloads are base64 in every transmission mode, so an APC
+    /// payload cannot contain ESC at all and this class of false positive does
+    /// not arise. The passthrough earns its place on the other grounds -- OSC 7,
+    /// 9;4 and 777 are unreachable today, and one parser is better than two.
+    #[test]
+    fn esc_terminates_an_apc_so_a_following_osc_is_genuine() {
+        let h = drive(b"\x1b_Gf=100;PAY\x1b]133;A\x07MORE\x1b\\");
+        assert_eq!(h.apc, vec![b"Gf=100;PAY".to_vec()], "the APC ends at the ESC");
+        assert_eq!(h.osc_unhandled.len(), 1, "the OSC 133 after it is real");
+        assert_eq!(h.osc_unhandled[0][0], b"133".to_vec());
+    }
+
 }
