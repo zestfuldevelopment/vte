@@ -2532,9 +2532,9 @@ mod tests {
         assert_eq!(h.osc_unhandled[0][1], b"file://host/tmp".to_vec());
     }
 
-    /// OSC 133 is the prompt-marking sequence zterm currently scans for with a
-    /// hand-rolled byte scanner in its PTY read path. Arriving here, in stream
-    /// order, is what lets that scanner be deleted rather than duplicated.
+    /// OSC 133 is the shell prompt-marking sequence. An embedder that wants it
+    /// today has to hand-roll a byte scanner in its PTY read path; arriving
+    /// here, in correct stream order, is what makes that unnecessary.
     #[test]
     fn osc_133_reaches_the_handler() {
         let h = drive(b"\x1b]133;A\x07");
@@ -2561,14 +2561,15 @@ mod tests {
     /// ESC terminates an APC payload, so an `ESC ] 133` appearing after image
     /// data is a **real** OSC 133, not image bytes misread as one.
     ///
-    /// This test exists to record a NEGATIVE result. The fork was partly
-    /// justified by the claim that zterm's `Osc133Scanner` produces a false
-    /// prompt mark from image data, evidenced by this exact input. It does not:
-    /// a correct parser dispatches the same OSC 133 here, because the ESC ended
-    /// the APC. Kitty payloads are base64 in every transmission mode, so an APC
-    /// payload cannot contain ESC at all and this class of false positive does
-    /// not arise. The passthrough earns its place on the other grounds -- OSC 7,
-    /// 9;4 and 777 are unreachable today, and one parser is better than two.
+    /// This test exists to record a NEGATIVE result, so it is not re-derived
+    /// wrongly. It is tempting to argue that a prompt-mark scanner running over
+    /// raw PTY bytes would misread this input, seeing an OSC 133 that is really
+    /// image data. It would not, and neither does a correct parser: the ESC
+    /// ends the APC, so the OSC 133 that follows is genuine. Graphics payloads
+    /// are base64 in every transmission mode, so an APC payload cannot contain
+    /// ESC at all and this class of false positive does not arise. The
+    /// passthrough is justified by unreachable OSCs -- 7, 9;4, 777 -- not by
+    /// this.
     #[test]
     fn esc_terminates_an_apc_so_a_following_osc_is_genuine() {
         let h = drive(b"\x1b_Gf=100;PAY\x1b]133;A\x07MORE\x1b\\");

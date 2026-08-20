@@ -46,17 +46,27 @@ const MAX_OSC_PARAMS: usize = 16;
 const MAX_OSC_RAW: usize = 1024;
 /// Maximum APC payload retained before the sequence is abandoned.
 ///
-/// **zestful divergence from upstream vte.** Upstream has no APC buffer at all,
-/// so it has no cap either. We buffer APC (see `State::ApcString`) and therefore
-/// have to bound it: the payload is attacker-supplied in the ordinary case --
-/// the "client" writing to a tty is any program, including a remote host over
-/// ssh -- so an APC that never terminates is otherwise unbounded allocation.
+/// **Divergence from upstream vte.** Upstream buffers no APC at all, so it has
+/// no cap to diverge from. We buffer (see `State::ApcString`) and therefore have
+/// to bound it: the payload is attacker-supplied in the ordinary case -- the
+/// "client" writing to a tty is any program, including a remote host over ssh --
+/// so an APC that never terminates is otherwise unbounded allocation.
 ///
-/// 256 KiB matches kitty, the reference implementation of the graphics protocol
-/// this exists to carry: `MAX_ESCAPE_CODE_LENGTH = BUF_SZ / 4u` with
-/// `BUF_SZ = 1024 * 1024` (kitty/vt-parser.c:18-21). The protocol recommends
-/// 4096-byte chunks, so this is ~64 chunks of headroom; a single non-chunked
-/// APC can legitimately be large, which is why the cap is not smaller.
+/// # Why this size
+///
+/// Sized from what a legitimate APC needs, plus headroom. The kitty graphics
+/// protocol, the reason APC buffering exists here, recommends chunking payloads
+/// into 4096-byte pieces, so a well-behaved client never approaches this; the
+/// cap is not smaller because a single *non-chunked* transmission is permitted
+/// and can legitimately be large. 256 KiB is ~64 chunks of slack.
+///
+/// It coincides with kitty's own `MAX_ESCAPE_CODE_LENGTH` (`BUF_SZ / 4u`,
+/// kitty/vt-parser.c:18-21), which is a useful sanity check but **not a
+/// protocol limit and not a precedent to copy blindly**: that number is the
+/// largest escape kitty will *buffer*, and it has a streaming hatch behind it
+/// -- on overflow it special-cases OSC 52, dispatching a partial payload and
+/// continuing (vt-parser.c:459-471), so OSC 52 is not bounded by it at all.
+/// Nothing in the graphics protocol specifies a maximum APC length.
 ///
 /// Note this bounds the *std* build only. Under `no_std` the shared `osc_raw`
 /// is an `ArrayVec` whose capacity (`OSC_RAW_BUF_SIZE`, default `MAX_OSC_RAW`)

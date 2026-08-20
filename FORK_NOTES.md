@@ -29,9 +29,9 @@ and no buffering**, and `Perform` has no APC method at all.
   PR #115: *"Ideally to ensure parser state doesn't get too big one would
   likely reuse the same byte buffers for both, since it's not possible to have
   two different escape sequences at the same time anyway."*
-- `const MAX_APC_RAW = 256 KiB`, matching kitty's `MAX_ESCAPE_CODE_LENGTH`
-  (`BUF_SZ / 4u`, kitty/vt-parser.c:18-21). Over the cap the sequence is
-  **discarded whole, never dispatched truncated**.
+- `const MAX_APC_RAW = 256 KiB`. Over the cap the sequence is **discarded
+  whole, never dispatched truncated**. See below for how the size was chosen —
+  it is *not* copied from kitty as a protocol limit.
 - `Perform::apc_dispatch(&mut self, _bytes: &[u8]) {}`, defaulted.
 
 ### `src/ansi.rs` — APC on `Handler`, and unhandled OSCs pass through
@@ -47,12 +47,18 @@ and no buffering**, and `Perform` has no APC method at all.
 
 ## Why
 
-`zestful-terminal` implements the kitty graphics protocol, which is carried
-entirely over APC. Full reasoning, measurements and the rejected alternatives
-(a byte tee in the PTY read path; the APC-truncating `Read` filter that Zellij,
-`par-term-emu-core-rust` and `kou` ship):
+The kitty graphics protocol is carried entirely over APC, so a terminal
+implementing it cannot receive a single byte of the protocol through stock vte.
 
-> `zestful-internal/docs/terminal/plans/2026-08-20-kitty-graphics-protocol.md`
+Two workarounds were considered and rejected. A **byte tee** ahead of the parser
+loses placement anchoring: the spec anchors an image at the cursor position when
+the final chunk arrives, and a tee reading the same buffer sees that position
+only after the parser has already consumed whatever moved the cursor later in
+the same `read()`. An **APC-truncating `Read` filter** — the approach Zellij's
+`KittyApcInterceptor`, `par-term-emu-core-rust`'s `apc_filter.rs` and `kou` all
+ship — is correct on anchoring, but it puts terminal-state mutation inside a
+`Read` impl and needs re-deriving the parser's own framing rules to find the
+boundaries.
 
 ## Two behaviours this changes, deliberately
 
@@ -79,14 +85,24 @@ ways and vte is not an outlier:
 All of that is **source reading; nobody has run these terminals.**
 
 **2. `MAX_APC_RAW` bounds a buffer upstream does not have.** Upstream buffers no
-APC at all, so it has no cap to diverge from. On overflow we discard rather than
-truncate-and-dispatch, because a truncated graphics command that looks
-well-formed corrupts the *assembled* image under `m=1` chunking — worse than a
-clean refusal. kitty made this same move: v0.32.2 truncated and dispatched
-(parser.c:1228-1231); current kitty reports an error and discards
-(vt-parser.c:472-473). We improve on kitty in one respect — it returns to ground
-immediately, so an oversized APC's tail is printed as text; we consume to the
-terminator first.
+APC at all, so it has no cap to diverge from.
+
+*The size* is chosen from what a legitimate APC needs: the graphics protocol
+recommends 4096-byte chunks, so 256 KiB is ~64 chunks of headroom, and it is not
+smaller because a single non-chunked transmission is permitted and can be large.
+It happens to equal kitty's `MAX_ESCAPE_CODE_LENGTH` (`BUF_SZ / 4u`,
+vt-parser.c:18-21). That is a sanity check, **not a precedent** — kitty's number
+is the largest escape it will *buffer*, and it keeps a streaming hatch behind
+it, special-casing OSC 52 on overflow to dispatch a partial payload and continue
+(vt-parser.c:459-471). Nothing in the protocol specifies a maximum APC length.
+
+*The policy* — discard rather than truncate-and-dispatch — is the load-bearing
+choice. A truncated graphics command that looks well-formed corrupts the
+*assembled* image under `m=1` chunking, which is worse than a clean refusal.
+kitty moved the same way: v0.32.2 truncated and dispatched (parser.c:1228-1231);
+current kitty reports an error and discards (vt-parser.c:472-473). We improve on
+it in one respect — kitty returns to ground immediately, so an oversized APC's
+tail is printed as text; we consume to the terminator first.
 
 ## Rebase costs
 
