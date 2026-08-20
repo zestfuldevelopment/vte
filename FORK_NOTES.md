@@ -90,10 +90,11 @@ APC at all, so it has no cap to diverge from.
 *The size* is **not** taken from the specification's 4096-byte chunk
 suggestion, which real clients ignore: kitty's own helper chunks at
 `128 * 1024` (tools/tui/graphics/command.go:287) on data that is already
-base64-encoded, so one `icat` escape carries up to 128 KiB. Measured — a
-440747-byte transmission arrives as 131072 + 131072 + 131072 + 47531. This cap
-is therefore **2x** the largest real escape, not 64x, and the margin is not why
-it is safe.
+base64-encoded, so one `icat` escape carries up to 128 KiB. Captured from
+`kitten 0.46.2`: a 410018-byte PNG goes out as five APCs, payloads 131072 x4
+and 22403, largest whole escape **131107 bytes**. Against 262144 that is
+**1.9995x** — just under two, not 64x and not even a clean 2x. The margin is
+not why this is safe.
 
 It is safe because it **equals kitty's own limit**, `MAX_ESCAPE_CODE_LENGTH =
 BUF_SZ / 4u` (vt-parser.c:18-21): an escape too long for us is too long for the

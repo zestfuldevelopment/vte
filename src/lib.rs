@@ -58,13 +58,16 @@ const MAX_OSC_RAW: usize = 1024;
 /// not use it: kitty's own graphics helper chunks at `chunk_size = 128 * 1024`
 /// (tools/tui/graphics/command.go:287), applied to data that is **already
 /// base64-encoded** — the encode happens before the loop — so one escape from
-/// `icat` carries up to 128 KiB of payload plus a short control block. Measured
-/// against the real client: a 440747-byte transmission arrives as four chunks
-/// of 131072, 131072, 131072 and 47531.
+/// `icat` carries up to 128 KiB of payload plus a short control block.
 ///
-/// So this cap is 2x the largest escape a real client emits, not the 64x a
-/// 4096-byte chunk would imply. That is a deliberately narrow margin, and the
-/// margin is not the reason it is safe.
+/// Captured from `kitten 0.46.2` rather than read: a 410018-byte PNG went out
+/// as five APCs with payloads of 131072 x4 and 22403, and the largest whole
+/// escape spanned **131107 bytes** from `ESC _` to the end of `ESC \`.
+///
+/// Against this cap's 262144 that is 1.9995x — just *under* two, since 131107
+/// doubled overshoots by 70 bytes. Not the 64x a 4096-byte chunk would imply,
+/// and not even a clean 2x. The margin is too thin to be the reason this is
+/// safe.
 ///
 /// **The reason it is safe is that it equals kitty's own limit.**
 /// `MAX_ESCAPE_CODE_LENGTH = BUF_SZ / 4u` with `BUF_SZ = 1024 * 1024`
