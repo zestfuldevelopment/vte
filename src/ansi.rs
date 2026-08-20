@@ -1002,7 +1002,11 @@ pub enum LineClearMode {
 /// Mode for clearing terminal.
 ///
 /// Relative to cursor.
-#[derive(Debug)]
+///
+/// The extra derives are a zestful addition: an embedder that queues screen
+/// events for later has to store and compare the mode, and mirroring the enum
+/// on its side would be a copy that silently rots against this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClearMode {
     /// Clear below cursor.
     Below,
