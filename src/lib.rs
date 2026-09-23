@@ -86,6 +86,23 @@ const MAX_OSC_RAW: usize = 1024;
 /// is already the binding limit and is far smaller.
 const MAX_APC_RAW: usize = 256 * 1024;
 
+/// Most bytes an OSC may buffer in the *std* build before it is discarded
+/// whole. **zestful addition.**
+///
+/// Upstream bounds `osc_raw` only under `no_std`, where it is an `ArrayVec`.
+/// With `std` it is a `Vec`, so an OSC that is never terminated grows without
+/// limit. Over this cap the sequence is dropped and the parser enters
+/// `State::OscIgnore`, which consumes to the terminator and dispatches nothing,
+/// exactly as an over-long APC does.
+///
+/// The same number as [`MAX_APC_RAW`], and for its reason: it is kitty's
+/// escape-code limit. Titles and shell integration (OSC 7, 133, 9;4, 777) are
+/// far below it. The cost is OSC 52: a clipboard write over about 192 KiB of
+/// text (256 KiB of base64) is dropped whole. kitty streams OSC 52 past its
+/// limit; we do not.
+#[cfg(feature = "std")]
+const MAX_OSC_RAW_STD: usize = MAX_APC_RAW;
+
 /// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`]
 ///
 /// [`Perform`]: trait.Perform.html
@@ -222,6 +239,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::OscString => self.advance_osc_string(performer, byte),
             State::ApcString => self.advance_apc_string(performer, byte),
             State::ApcIgnore => self.advance_apc_ignore(performer, byte),
+            // An over-long OSC ends exactly as an over-long APC does.
+            #[cfg(feature = "std")]
+            State::OscIgnore => self.advance_apc_ignore(performer, byte),
             State::SosPmApcString => self.anywhere(performer, byte),
             State::Ground => unreachable!(),
         }
@@ -604,7 +624,22 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 }
                 self.action_osc_put_param()
             },
-            _ => self.action_osc_put(byte),
+            _ => {
+                #[cfg(feature = "std")]
+                {
+                    if self.osc_raw.len() >= MAX_OSC_RAW_STD {
+                        // Over the cap: discard the whole sequence rather
+                        // than dispatch a prefix. A truncated OSC 52 would
+                        // put a partial payload on the clipboard. See
+                        // `MAX_OSC_RAW_STD`.
+                        self.osc_raw.clear();
+                        self.osc_num_params = 0;
+                        self.state = State::OscIgnore;
+                        return;
+                    }
+                }
+                self.action_osc_put(byte)
+            },
         }
     }
 
@@ -924,6 +959,12 @@ enum State {
     /// APC that has exceeded [`MAX_APC_RAW`]: consume to the terminator, then
     /// return to ground **without dispatching**. Mirrors `CsiIgnore`/`DcsIgnore`.
     ApcIgnore,
+    /// OSC that has exceeded `MAX_OSC_RAW_STD`: consume to the terminator,
+    /// then return to ground **without dispatching**. **zestful addition**,
+    /// the OSC twin of `ApcIgnore`. The `no_std` build keeps upstream's
+    /// fixed buffer and never enters it.
+    #[cfg(feature = "std")]
+    OscIgnore,
     SosPmApcString,
     #[default]
     Ground,
@@ -1886,4 +1927,79 @@ mod tests {
         assert_eq!(apc_payloads(&seq), vec![Vec::<u8>::new()]);
     }
 
+    // OSC over-length. **zestful addition**; see `MAX_OSC_RAW_STD`.
+
+    fn osc_count(seq: &[Sequence]) -> usize {
+        seq.iter().filter(|s| matches!(s, Sequence::Osc(..))).count()
+    }
+
+    /// An OSC that never ends within the cap, streamed over many `advance`
+    /// calls: the buffer never holds more than the cap, nothing is
+    /// dispatched, and the text after the terminator is printed.
+    #[cfg(feature = "std")]
+    #[test]
+    fn an_over_long_osc_is_bounded_and_dropped_whole() {
+        for (intro, name) in
+            [(&b"\x1b]2;"[..], "title"), (b"\x1b]52;c;", "clipboard"), (b"\x1b]9999;", "unknown")]
+        {
+            for end in [&b"\x07"[..], b"\x1b\\"] {
+                let mut d = Dispatcher::default();
+                let mut p: Parser = Parser::new();
+                p.advance(&mut d, b"A");
+                p.advance(&mut d, intro);
+                let chunk = [b'x'; 64 * 1024];
+                let mut most = 0;
+                for _ in 0..(MAX_OSC_RAW_STD / chunk.len() + 3) {
+                    p.advance(&mut d, &chunk);
+                    most = most.max(p.osc_raw.len());
+                }
+                assert!(most <= MAX_OSC_RAW_STD, "{name}: buffer reached {most}");
+                assert_eq!(p.osc_raw.len(), 0, "{name}: the discarded body is not kept");
+                p.advance(&mut d, end);
+                p.advance(&mut d, b"B");
+                assert_eq!(osc_count(&d.dispatched), 0, "{name}: a truncated OSC was dispatched");
+                assert_eq!(printed(&d.dispatched), "AB", "{name}: text around it");
+            }
+        }
+    }
+
+    /// Exactly at the cap still dispatches, and the parser is usable after an
+    /// over-long one: the boundary is not off by one, and the ignore state
+    /// ends at its terminator.
+    #[cfg(feature = "std")]
+    #[test]
+    fn an_osc_at_the_cap_is_delivered_and_the_next_one_after_a_drop_is_too() {
+        let mut input = b"\x1b]2;".to_vec();
+        input.extend(core::iter::repeat(b'x').take(MAX_OSC_RAW_STD - 1));
+        input.push(0x07);
+        let seq = apc_run(&input);
+        assert_eq!(osc_count(&seq), 1, "at the cap");
+
+        let mut input = b"\x1b]2;".to_vec();
+        input.extend(core::iter::repeat(b'x').take(MAX_OSC_RAW_STD + 10));
+        input.extend_from_slice(b"\x07\x1b]2;next\x07");
+        let seq = apc_run(&input);
+        assert_eq!(osc_count(&seq), 1, "only the second one");
+        let Sequence::Osc(params, _) = seq.iter().find(|s| matches!(s, Sequence::Osc(..))).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(params[1], b"next".to_vec());
+    }
+
+    /// CAN and SUB end an over-long OSC without dispatching it, and are
+    /// executed, as they are for an over-long APC.
+    #[cfg(feature = "std")]
+    #[test]
+    fn can_and_sub_end_an_over_long_osc_without_dispatching() {
+        for abort in [0x18u8, 0x1a] {
+            let mut input = b"A\x1b]2;".to_vec();
+            input.extend(core::iter::repeat(b'x').take(MAX_OSC_RAW_STD + 10));
+            input.extend_from_slice(&[abort, b'B']);
+            let seq = apc_run(&input);
+            assert_eq!(osc_count(&seq), 0, "0x{abort:02x}");
+            assert!(seq.contains(&Sequence::Execute(abort)), "0x{abort:02x}");
+            assert_eq!(printed(&seq), "AB");
+        }
+    }
 }

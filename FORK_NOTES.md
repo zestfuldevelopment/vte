@@ -34,6 +34,25 @@ and no buffering**, and `Perform` has no APC method at all.
   it is *not* copied from kitty as a protocol limit.
 - `Perform::apc_dispatch(&mut self, _bytes: &[u8]) {}`, defaulted.
 
+### `src/lib.rs` — an OSC is bounded in the `std` build
+
+Upstream bounds the OSC buffer only under `no_std`, where `osc_raw` is an
+`ArrayVec`. With `std` it is a `Vec`, and an OSC that is never terminated grows
+it without limit.
+
+- `const MAX_OSC_RAW_STD = MAX_APC_RAW` (256 KiB), `std` only. Over the cap
+  the OSC is **discarded whole, never dispatched truncated**, and the parser
+  enters `State::OscIgnore`. That state is the OSC twin of `ApcIgnore`: it
+  consumes to BEL or ESC, executes CAN and SUB, and dispatches nothing, so the
+  rest of the sequence is not printed as text either.
+- The cost: an OSC 52 clipboard write over about 192 KiB of text (256 KiB of
+  base64) is dropped. kitty streams OSC 52 past its escape limit; this parser
+  does not. Titles and shell integration (OSC 7, 133, 9;4, 777) are far below
+  the cap.
+- `no_std` keeps upstream's behaviour: its fixed buffer is already the limit.
+- Out of scope: many small **completed** OSCs. Each is dispatched when it ends
+  and is not retained by the parser.
+
 ### `src/ansi.rs` — APC on `Handler`, and unhandled OSCs pass through
 
 - `Handler::apc_dispatch`, defaulted, and `Performer::apc_dispatch` forwarding
