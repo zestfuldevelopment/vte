@@ -260,7 +260,11 @@ struct SyncState<T: Timeout> {
 
 impl<T: Timeout> Default for SyncState<T> {
     fn default() -> Self {
-        Self { buffer: Vec::with_capacity(SYNC_BUFFER_SIZE), timeout: Default::default() }
+        // Empty until a synchronized update starts: every pane owns one of these,
+        // and reserving SYNC_BUFFER_SIZE up front commits 2 MiB per pane that
+        // most never use. The limit is checked against the constant, not the
+        // capacity, so growing on demand changes nothing else.
+        Self { buffer: Vec::new(), timeout: Default::default() }
     }
 }
 
