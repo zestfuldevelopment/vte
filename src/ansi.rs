@@ -720,6 +720,9 @@ pub trait Handler {
     /// Report text area size in characters.
     fn text_area_size_chars(&mut self) {}
 
+    /// Report one character cell's size in pixels (XTWINOPS 16).
+    fn cell_size_pixels(&mut self) {}
+
     /// Set hyperlink.
     fn set_hyperlink(&mut self, _: Option<Hyperlink>) {}
 
@@ -1781,6 +1784,7 @@ where
             ('T', []) => handler.scroll_down(next_param_or(1) as usize),
             ('t', []) => match next_param_or(1) as usize {
                 14 => handler.text_area_size_pixels(),
+                16 => handler.cell_size_pixels(),
                 18 => handler.text_area_size_chars(),
                 22 => handler.push_title(),
                 23 => handler.pop_title(),
@@ -2507,9 +2511,19 @@ mod tests {
         apc: Vec<Vec<u8>>,
         osc_unhandled: Vec<Vec<Vec<u8>>>,
         titles: Vec<Option<String>>,
+        cell_size_requests: usize,
+        text_area_pixel_requests: usize,
     }
 
     impl Handler for PassthroughHandler {
+        fn cell_size_pixels(&mut self) {
+            self.cell_size_requests += 1;
+        }
+
+        fn text_area_size_pixels(&mut self) {
+            self.text_area_pixel_requests += 1;
+        }
+
         fn apc_dispatch(&mut self, bytes: &[u8]) {
             self.apc.push(bytes.to_vec());
         }
@@ -2528,6 +2542,21 @@ mod tests {
         let mut handler = PassthroughHandler::default();
         processor.advance(&mut handler, input);
         handler
+    }
+
+    /// XTWINOPS 16 asks for one cell's size in pixels. Upstream matches 14, 18,
+    /// 22 and 23 under `t` and drops 16 as unhandled; a program drawing over
+    /// placeholder cells needs the cell to size its picture. The fork
+    /// dispatches it to its own method, beside 14's.
+    #[test]
+    fn csi_16_t_reaches_the_handler() {
+        let h = drive(b"\x1b[16t");
+        assert_eq!(h.cell_size_requests, 1);
+        assert_eq!(h.text_area_pixel_requests, 0);
+
+        let h = drive(b"\x1b[14t");
+        assert_eq!(h.cell_size_requests, 0);
+        assert_eq!(h.text_area_pixel_requests, 1);
     }
 
     /// OSC 7 (cwd) is one vte does not implement. Upstream logs and drops it;
@@ -2585,5 +2614,4 @@ mod tests {
         assert_eq!(h.osc_unhandled.len(), 1, "the OSC 133 after it is real");
         assert_eq!(h.osc_unhandled[0][0], b"133".to_vec());
     }
-
 }
