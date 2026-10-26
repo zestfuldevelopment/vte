@@ -63,6 +63,11 @@ it without limit.
   **everything else falls to that site** — so OSC 7, 9;4, 133 and 777 are
   unreachable without this. With it, each is a match arm in the embedder rather
   than a second parser in its PTY read path.
+- `Handler::cell_size_pixels`, defaulted, dispatched for `CSI 16 t` (XTWINOPS
+  16, one cell's size in pixels) beside upstream's 14, 18, 22 and 23, which
+  were the only `t` parameters that did not fall to `unhandled!()`. A program
+  drawing over placeholder cells needs the cell to size its picture
+  (2026-10-24).
 
 ## Why
 
@@ -156,8 +161,8 @@ tail is printed as text; we consume to the terminator first.
 
 ## Tests
 
-`cargo test --features std,ansi` → **70 passed**: upstream's 54 unmodified, plus
-16 covering APC delivery, chunk reassembly across `advance` calls, BEL and ST
+`cargo test --features std,ansi` → **74 passed**: upstream's 54 unmodified, plus
+20 covering APC delivery, `CSI 16 t` reaching `cell_size_pixels` (and 14 t not), chunk reassembly across `advance` calls, BEL and ST
 termination, the cap boundary and its discard policy, CAN/SUB abort without
 dispatch, PM/SOS remaining untouched, `osc_raw` sharing, and the OSC
 passthrough. `cargo build --no-default-features` (no_std) is clean.
