@@ -68,6 +68,10 @@ it without limit.
   were the only `t` parameters that did not fall to `unhandled!()`. A program
   drawing over placeholder cells needs the cell to size its picture
   (2026-10-24).
+- `Handler::private_device_status`, defaulted, dispatched for `CSI ? Ps n`.
+  Upstream's `n` arm matches no intermediates and drops the `?` form. 996 is
+  the colour-scheme query herdr and other TUIs send to learn light or dark
+  (2026-11-09, zestful-terminal ZT-1171).
 
 ## Why
 
@@ -161,8 +165,8 @@ tail is printed as text; we consume to the terminator first.
 
 ## Tests
 
-`cargo test --features std,ansi` → **74 passed**: upstream's 54 unmodified, plus
-20 covering APC delivery, `CSI 16 t` reaching `cell_size_pixels` (and 14 t not), chunk reassembly across `advance` calls, BEL and ST
+`cargo test --features std,ansi` → **75 passed**: upstream's 54 unmodified, plus
+21 covering APC delivery, `CSI 16 t` reaching `cell_size_pixels` (and 14 t not), `CSI ? 996 n` reaching `private_device_status` (and `CSI 6 n` not), chunk reassembly across `advance` calls, BEL and ST
 termination, the cap boundary and its discard policy, CAN/SUB abort without
 dispatch, PM/SOS remaining untouched, `osc_raw` sharing, and the OSC
 passthrough. `cargo build --no-default-features` (no_std) is clean.
