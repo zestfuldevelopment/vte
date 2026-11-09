@@ -723,6 +723,11 @@ pub trait Handler {
     /// Report one character cell's size in pixels (XTWINOPS 16).
     fn cell_size_pixels(&mut self) {}
 
+    /// A DEC private device status report, `CSI ? Ps n`. The only one an
+    /// embedder answers today is 996, the colour-scheme query, whose reply is
+    /// `CSI ? 997 ; 1 n` for dark or `CSI ? 997 ; 2 n` for light.
+    fn private_device_status(&mut self, _: usize) {}
+
     /// Set hyperlink.
     fn set_hyperlink(&mut self, _: Option<Hyperlink>) {}
 
@@ -1745,6 +1750,7 @@ where
                 }
             },
             ('n', []) => handler.device_status(next_param_or(0) as usize),
+            ('n', [b'?']) => handler.private_device_status(next_param_or(0) as usize),
             ('P', []) => handler.delete_chars(next_param_or(1) as usize),
             ('p', [b'$']) => {
                 let mode = next_param_or(0);
@@ -2513,9 +2519,19 @@ mod tests {
         titles: Vec<Option<String>>,
         cell_size_requests: usize,
         text_area_pixel_requests: usize,
+        device_status: Vec<usize>,
+        private_device_status: Vec<usize>,
     }
 
     impl Handler for PassthroughHandler {
+        fn device_status(&mut self, n: usize) {
+            self.device_status.push(n);
+        }
+
+        fn private_device_status(&mut self, n: usize) {
+            self.private_device_status.push(n);
+        }
+
         fn cell_size_pixels(&mut self) {
             self.cell_size_requests += 1;
         }
@@ -2557,6 +2573,21 @@ mod tests {
         let h = drive(b"\x1b[14t");
         assert_eq!(h.cell_size_requests, 0);
         assert_eq!(h.text_area_pixel_requests, 1);
+    }
+
+    /// `CSI ? 996 n` asks for the colour scheme. Upstream's `n` arm matches
+    /// no intermediates, so the `?` form was dropped as unhandled. The fork
+    /// dispatches it to its own method, and the plain DSR still reaches
+    /// `device_status` alone.
+    #[test]
+    fn csi_question_996_n_reaches_the_handler() {
+        let h = drive(b"\x1b[?996n");
+        assert_eq!(h.private_device_status, vec![996]);
+        assert!(h.device_status.is_empty());
+
+        let h = drive(b"\x1b[6n");
+        assert_eq!(h.device_status, vec![6]);
+        assert!(h.private_device_status.is_empty());
     }
 
     /// OSC 7 (cwd) is one vte does not implement. Upstream logs and drops it;
